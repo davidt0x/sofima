@@ -156,6 +156,82 @@ def inplane_force(x: jnp.ndarray,
   return f1p + f2p + f3p + f4p - f1n - f2n - f3n - f4n
 
 
+def inplane_force_lowmem(x: jnp.ndarray,
+                  k: float,
+                  stride: float,
+                  prefer_orig_order=False) -> jnp.ndarray:
+  """Computes in-plane forces on the nodes of a spring mesh.
+
+  Args:
+    x: [2, z, y, x] array of mesh node positions, in relative format
+    k: spring constant
+    stride: XY stride of the spring mesh grid
+    prefer_orig_order: whether to change the force formulation so that the
+      original relative spatial ordering of the nodes is energetically preferred
+
+  Returns:
+    [2, z, y, x] array of forces
+  """
+  l0 = stride
+  l0_diag = jnp.sqrt(2.0) * l0
+
+  def _xy_vec(x, y):
+    return jnp.array([x, y]).reshape([2, 1, 1, 1])
+
+  dx = x[..., 1:] - x[..., :-1] + _xy_vec(l0, 0)
+  l = jnp.linalg.norm(dx, axis=0)
+  if prefer_orig_order:
+    f = -k * (
+        1. -
+        l0 * jnp.array([jnp.sign(dx[0]), jnp.ones_like(dx[1])]) / l) * dx
+  else:
+    f = -k * (1. - l0 / l) * dx
+  f = jnp.nan_to_num(f, copy=False, posinf=0., neginf=0.)
+  ftotal = jnp.pad(f, ((0, 0), (0, 0), (0, 0), (1, 0)))
+  ftotal -= jnp.pad(f, ((0, 0), (0, 0), (0, 0), (0, 1)))
+
+  # | springs
+  dx = x[..., 1:, :] - x[..., :-1, :] + _xy_vec(0, l0)
+  l = jnp.linalg.norm(dx, axis=0)
+  if prefer_orig_order:
+    f = -k * (1. - l0 * jnp.array([jnp.ones_like(dx[0]),
+                                    jnp.sign(dx[1])]) / l) * dx
+  else:
+    f = -k * (1. - l0 / l) * dx
+  f = jnp.nan_to_num(f, copy=False, posinf=0., neginf=0.)
+  ftotal += jnp.pad(f, ((0, 0), (0, 0), (1, 0), (0, 0)))
+  ftotal -= jnp.pad(f, ((0, 0), (0, 0), (0, 1), (0, 0)))
+
+  # We want to keep elasticity E constant, and k ~ E/l.
+  k2 = k / jnp.sqrt(2.0)
+
+  # \ springs
+  dx = x[:, :, 1:, 1:] - x[:, :, :-1, :-1] + _xy_vec(l0, l0)
+  l = jnp.linalg.norm(dx, axis=0)
+  if prefer_orig_order:
+    f = -k2 * (1. - l0_diag *
+                jnp.array([jnp.sign(dx[0]), jnp.sign(dx[1])]) / l) * dx
+  else:
+    f = -k2 * (1. - l0_diag / l) * dx
+  f = jnp.nan_to_num(f, copy=False, posinf=0., neginf=0.)
+  ftotal += jnp.pad(f, ((0, 0), (0, 0), (1, 0), (1, 0)))
+  ftotal -= jnp.pad(f, ((0, 0), (0, 0), (0, 1), (0, 1)))
+
+  # # / springs
+  dx = x[:, :, 1:, :-1] - x[:, :, :-1, 1:] + _xy_vec(-l0, l0)
+  l = jnp.linalg.norm(dx, axis=0)
+  if prefer_orig_order:
+    f = -k2 * (1. - l0_diag *
+                jnp.array([-jnp.sign(dx[0]), jnp.sign(dx[1])]) / l) * dx
+  else:
+    f = -k2 * (1. - l0_diag / l) * dx
+  f = jnp.nan_to_num(f, copy=False, posinf=0., neginf=0.)
+  ftotal += jnp.pad(f, ((0, 0), (0, 0), (1, 0), (0, 1)))
+  ftotal -= jnp.pad(f, ((0, 0), (0, 0), (0, 1), (1, 0)))
+
+  return ftotal
+  
+
 MESH_LINK_DIRECTIONS = (  # xyz
     # 6 nearest neighbors
     (1, 0, 0),
@@ -311,7 +387,8 @@ def velocity_verlet(x: jnp.ndarray,
                     fire_dt=None,
                     fire_alpha=None,
                     mesh_force=inplane_force,
-                    prev_fn=None):
+                    prev_fn=None,
+                    prev_fn_kwargs=None):
   """Executes a sequence of (damped) velocity Verlet steps.
 
   Optionally uses the FIRE integrator. Disabling or reducing
@@ -346,6 +423,8 @@ def velocity_verlet(x: jnp.ndarray,
     mesh_force: callable with the signature of `inplane_force` returning a field
       representing internal mesh forces
     prev_fn: callable taking the 'x' mesh array and returning the 'prev' array
+    prev_fn_kwargs: optional keyword arguments to pass to 'prev_fn'. JAX can have 
+      problems with JIT compiling functions that close over large constants.
 
   Returns:
     updated mesh state; this is a tuple of:
@@ -355,11 +434,15 @@ def velocity_verlet(x: jnp.ndarray,
     The latter 4 entries are only present when using FIRE.
   """
 
+  if prev_fn_kwargs is None:
+    prev_fn_kwargs = {}
+
   # The code assumes uniform masses set to unity, so force=acceleration.
   def _force(x, prev, cap):
     a = mesh_force(x, config.k, config.stride, config.prefer_orig_order)
     if prev_fn is not None:
-      prev = prev_fn(x)
+
+      prev = prev_fn(x, **prev_fn_kwargs)
 
     if prev is not None:
       a += jnp.clip(-config.k0 * jnp.nan_to_num(x - prev), -cap, cap)
@@ -444,7 +527,8 @@ def relax_mesh(
     prev: Optional[jnp.ndarray],
     config: IntegrationConfig,
     mesh_force=inplane_force,
-    prev_fn=None) -> tuple[jnp.ndarray, list[float], int]:
+    prev_fn=None,
+    prev_fn_kwargs=None) -> tuple[jnp.ndarray, list[float], int]:
   """Simulates mesh relaxation.
 
   Args:
@@ -462,7 +546,6 @@ def relax_mesh(
       list of kinetic energy history
       number of simulation steps executed
   """
-
   t = 0
   v = jnp.zeros_like(x)
   dt = config.dt
@@ -491,7 +574,8 @@ def relax_mesh(
         fire_alpha=alpha,
         force_cap=cap,
         mesh_force=mesh_force,
-        prev_fn=prev_fn)
+        prev_fn=prev_fn,
+        prev_fn_kwargs=prev_fn_kwargs)
     t += config.num_iters
     x, v = state[:2]
     v_mag = jnp.linalg.norm(v, axis=0)
