@@ -595,4 +595,4 @@ def relax_mesh(
       # Increase cap to ensure progress towards the termination condition.
       cap = min(cap * config.cap_scale, config.final_cap)
 
-  return x, e_kin, t
+  return x, e_kin, t, v
